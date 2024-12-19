@@ -1,13 +1,48 @@
 import os
 import torch
+import torch.nn.functional as F
 import torch.nn as nn
 import numpy as np
 import torchvision.models as models
 from modelscope.msdatasets import MsDataset
 from utils import download
+from torchsummary import summary
 
 TRAIN_MODES = ["linear_probe", "full_finetune", "no_pretrain"]
 
+'''
+    classifier是一个conv layer，output shape: [7, 258(T)]
+    corresponding label shape: [7, 258]
+    threshold 0.5 to binarize the output
+    loss func is BCE
+'''
+class Interpolate(nn.Module):
+    def __init__(self, size=None, scale_factor=None, mode='bilinear', align_corners=False):
+        super(Interpolate, self).__init__()
+        self.size = size
+        self.scale_factor = scale_factor
+        self.mode = mode
+        self.align_corners = align_corners
+
+    def forward(self, x):
+        return F.interpolate(x, size=self.size, scale_factor=self.scale_factor,
+                             mode=self.mode, align_corners=self.align_corners)
+
+def compute_f1(preds, labels):
+    threshold = 0.5
+    preds = (preds >= threshold).int()
+    labels = (labels >= threshold).int()
+    TP_per_frame = (preds & labels).sum(dim=1)  # Sum over classes, shape: [bsz, T]
+    FP_per_frame = (preds & ~labels).sum(dim=1)  # False positives, shape: [bsz, T]
+    FN_per_frame = (~preds & labels).sum(dim=1)  
+
+    epsilon = 1e-7  # To avoid division by zero
+    precision_per_frame = TP_per_frame / (TP_per_frame + FP_per_frame + epsilon)  # Shape: [bsz, T]
+    recall_per_frame = TP_per_frame / (TP_per_frame + FN_per_frame + epsilon)  # Shape: [bsz, T]
+    f1_per_frame = 2 * precision_per_frame * recall_per_frame / (precision_per_frame + recall_per_frame + epsilon)  # Shape: [bsz, T]
+    frame_f1 = f1_per_frame.mean()
+    
+    return frame_f1
 
 def get_weight(Ytr):  # (2493, 258, 6)
     mp = Ytr.transpose(0, 2, 1)[:].sum(0).sum(0)  # (6,)
@@ -18,6 +53,7 @@ def get_weight(Ytr):  # (2493, 258, 6)
 
 
 def sp_loss(fla_pred, target, gwe):
+    # class-wise weight vector?
     we = gwe.to("cuda" if torch.cuda.is_available() else "cpu")
     wwe = 1
     we *= wwe
@@ -25,11 +61,15 @@ def sp_loss(fla_pred, target, gwe):
     for _, (out, fl_target) in enumerate(zip(fla_pred, target)):
         twe = we.view(-1, 1).repeat(1, fl_target.size(1)).type(torch.cuda.FloatTensor)
         ttwe = twe * fl_target.data + (1 - fl_target.data) * wwe
+
+        # 已经包含sigmoid和BCE
         loss_fn = nn.BCEWithLogitsLoss(weight=ttwe, size_average=True)
-        print(target.shape)
+        # print(target.shape)
         loss += loss_fn(torch.squeeze(out), fl_target)
 
     return loss
+
+
 
 
 class Net:
@@ -37,6 +77,8 @@ class Net:
         self,
         backbone: str,
         train_mode: int,
+        cls_num: int,
+        ori_T: int,
         imgnet_ver="v1",
         weight_path="",
     ):
@@ -46,13 +88,17 @@ class Net:
         if not hasattr(models, backbone):
             raise ValueError(f"Unsupported model {backbone}.")
 
-        self.output_size = 512
         self.imgnet_ver = imgnet_ver
         self.training = bool(weight_path == "")
         self.full_finetune = bool(train_mode > 0)
         self.type, self.weight_url, self.input_size = self._model_info(backbone)
         self.model: torch.nn.Module = eval("models.%s()" % backbone)
-        linear_output = self._set_outsize()
+        self.ori_T = ori_T
+
+        self.out_channel_before_classifier = 0
+        self._set_outsize() # set out channel size
+
+        self.cls_num = cls_num
         if self.training:
             if train_mode < 2:
                 weight_path = self._download_model(self.weight_url)
@@ -65,18 +111,20 @@ class Net:
 
             for parma in self.model.parameters():
                 parma.requires_grad = self.full_finetune
-
-            self._set_classifier(linear_output)
+            # classfier is a Conv layer outputs [7, 258]
+            self._set_classifier()
+   
             self.model.train()
 
         else:
-            self._set_classifier(linear_output)
+            self._set_classifier()
             checkpoint = (
                 torch.load(weight_path)
                 if torch.cuda.is_available()
                 else torch.load(weight_path, map_location="cpu")
             )
             self.model.load_state_dict(checkpoint, False)
+
             self.model.eval()
 
     def _get_backbone(self, backbone_ver, backbone_list):
@@ -108,74 +156,79 @@ class Net:
 
         return weight_path
 
-    def _create_classifier(self, cls_num: int, linear_output: bool):
-        q = (1.0 * self.output_size / cls_num) ** 0.25
-        l1 = int(q * cls_num)
-        l2 = int(q * l1)
-        l3 = int(q * l2)
-        if linear_output:
-            return nn.Sequential(
-                nn.Dropout(),
-                nn.Linear(self.output_size, l3),
-                nn.ReLU(inplace=True),
-                nn.Dropout(),
-                nn.Linear(l3, l2),
-                nn.ReLU(inplace=True),
-                nn.Dropout(),
-                nn.Linear(l2, l1),
-                nn.ReLU(inplace=True),
-                nn.Linear(l1, cls_num),
-            )
+    def _create_classifier(self):
+        # classifier is a Conv2d, output: [cls_num, T]
+        # frequency dim -> cls_num
+        # temp_nn = nn.Conv2d(Fequency, cls_num, (3,1), padding=?)
+        '''
+            channel -> cls_num
+            T -> original T size
+            F -> 1
 
-        else:
-            return nn.Sequential(
-                nn.Dropout(),
-                nn.Conv2d(self.output_size, l3, kernel_size=(1, 1), stride=(1, 1)),
-                nn.ReLU(inplace=True),
-                nn.AdaptiveAvgPool2d(output_size=(1, 1)),
-                nn.Flatten(),
-                nn.Linear(l3, l2),
-                nn.ReLU(inplace=True),
-                nn.Dropout(),
-                nn.Linear(l2, l1),
-                nn.ReLU(inplace=True),
-                nn.Linear(l1, cls_num),
-            )
+            Question: How many deconvolution layer is needed?
+                      Maybe we should start with 4.
 
-    def _set_outsize(self, debug_mode=False):
+            Deconvolution + ReLU + BN
+        '''
+        original_T_size = self.ori_T
+        upsample_module = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1, None)), # F -> 1
+            
+            nn.ConvTranspose2d(self.out_channel_before_classifier, 256, kernel_size=(1,4), stride=(1,2), padding=(0,1)),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm2d(256),
+
+            nn.ConvTranspose2d(256, 128, kernel_size=(1,4), stride=(1,2), padding=(0,1)),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm2d(128),
+
+            nn.ConvTranspose2d(128, 64, kernel_size=(1,4), stride=(1,2), padding=(0,1)),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm2d(64),
+
+            nn.ConvTranspose2d(64, 32, kernel_size=(1,4), stride=(1,2), padding=(0,1)),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm2d(32),
+
+            # input for Interp: [bsz, C, 1, T]
+            Interpolate(size=(1, original_T_size), mode='bilinear', align_corners=False),
+            # classifier
+            nn.Conv2d(32, 32, kernel_size=(1,1)),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm2d(32),
+            nn.Conv2d(32, self.cls_num, kernel_size=(1,1)) 
+        )
+
+        
+        return upsample_module
+
+    def _set_outsize(self):
+        #### get the output size before classifier ####
+        conv2d_out_ch = []
         for name, module in self.model.named_modules():
+            if isinstance(module, torch.nn.Conv2d):
+                conv2d_out_ch.append(module.out_channels) 
+
             if (
                 str(name).__contains__("classifier")
                 or str(name).__eq__("fc")
                 or str(name).__contains__("head")
-                or hasattr(module, "classifier")
+                # or hasattr(module, "classifier")
             ):
-                if isinstance(module, torch.nn.Linear):
-                    self.output_size = module.in_features
-                    if debug_mode:
-                        print(
-                            f"{name}(Linear): {self.output_size} -> {module.out_features}"
-                        )
+                if isinstance(module, torch.nn.Conv2d): 
+                    conv2d_out_ch.append(module.in_channels)
+                    break
 
-                    return True
+        self.out_channel_before_classifier = conv2d_out_ch[-1]
 
-                if isinstance(module, torch.nn.Conv2d):
-                    self.output_size = module.in_channels
-                    if debug_mode:
-                        print(
-                            f"{name}(Conv2d): {self.output_size} -> {module.out_channels}"
-                        )
 
-                    return False
-
-        return False
-
-    def _set_classifier(self, cls_num, linear_output):
+    def _set_classifier(self):
+        #### set custom classifier ####
         if self.type == "convnext":
             del self.model.classifier[2]
             self.model.classifier = nn.Sequential(
                 *list(self.model.classifier)
-                + list(self._create_classifier(cls_num, linear_output))
+                + list(self._create_classifier())
             )
             self.classifier = self.model.classifier
 
@@ -183,24 +236,26 @@ class Net:
             del self.model.classifier[5]
             self.model.classifier = nn.Sequential(
                 *list(self.model.classifier)
-                + list(self._create_classifier(cls_num, linear_output))
+                + list(self._create_classifier())
             )
             self.classifier = self.model.classifier
 
         elif hasattr(self.model, "classifier"):
-            self.model.classifier = self._create_classifier(cls_num, linear_output)
+            '''e.g., squeezenet1_1'''
+            # self.model.classifier = self._create_classifier(cls_num, linear_output)
+            self.model.classifier = self._create_classifier()
             self.classifier = self.model.classifier
 
         elif hasattr(self.model, "fc"):
-            self.model.fc = self._create_classifier(cls_num, linear_output)
+            self.model.fc = self._create_classifier()
             self.classifier = self.model.fc
 
         elif hasattr(self.model, "head"):
-            self.model.head = self._create_classifier(cls_num, linear_output)
+            self.model.head = self._create_classifier()
             self.classifier = self.model.head
 
         else:
-            self.model.heads.head = self._create_classifier(cls_num, linear_output)
+            self.model.heads.head = self._create_classifier()
             self.classifier = self.model.heads.head
 
         for parma in self.classifier.parameters():
@@ -217,7 +272,9 @@ class Net:
         if self.type == "googlenet" and self.training:
             return self.model(x)[0]
         else:
-            return self.model(x)
+            # return self.model[:-2](x)
+            out = self.model(x)
+            return out if out.dim()==3 else out.view(out.size(0), self.cls_num, self.ori_T)
 
     def parameters(self):
         if self.full_finetune:
