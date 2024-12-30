@@ -104,7 +104,7 @@ def load_data(
         )
     )
     # num_workers = os.cpu_count() // 2
-    num_workers = 4  
+    num_workers = 0 
     traLoader = DataLoader(
         trainset,
         batch_size=bs,

@@ -6,12 +6,12 @@ import torch.utils.data
 import torch.optim as optim
 import torch.nn.functional as F
 from datetime import datetime
-from sklearn.metrics import classification_report, accuracy_score, confusion_matrix
+# from sklearn.metrics import classification_report, accuracy_score, confusion_matrix
 from plot import np, plot_f1, plot_loss, plot_confusion_matrix
 from utils import os, torch, tqdm, to_cuda, save_to_csv
 from data import DataLoader, prepare_data, load_data
 from model import Net, sp_loss, TRAIN_MODES, compute_f1
-
+from trans_model import t_Net
 
 def eval_model(
     model: Net,
@@ -24,19 +24,13 @@ def eval_model(
     loss_list: list,
     log_dir: str,
 ):
-    # y_true, y_pred = [], []
- 
     with torch.no_grad():
         f1 = []
         for data in tqdm(trainLoader, desc="Batch evaluation on trainset"):
             inputs = to_cuda(data[data_col])
             labels = to_cuda(data[label_col])
             outputs = model.forward(inputs)
-            # predicts = torch.max(outputs.data, 1)[1]
             predicts = F.sigmoid(outputs)
-
-            # y_true.extend(labels.tolist())
-            # y_pred.extend(predicts.tolist())
 
             frame_f1_mean = compute_f1(predicts, labels)
             f1.append(frame_f1_mean)
@@ -80,8 +74,11 @@ def test_model(
     label_col: str,
     log_dir: str,
 ):
-    model = Net(backbone, 0, cls_num, ori_T,  weight_path=f"{log_dir}/save.pt")
-    # y_true, y_pred = [], []
+    if 'vit' in backbone or 'swin' in backbone:
+        model = t_Net(backbone, 0, cls_num, ori_T, weight_path=f"{log_dir}/save.pt")
+    else:
+        model = Net(backbone, 0, cls_num, ori_T,  weight_path=f"{log_dir}/save.pt")
+
     f1 = []
     with torch.no_grad():
         for data in tqdm(testLoader, desc="Batch evaluation on testset"):
@@ -95,10 +92,6 @@ def test_model(
         test_f1 = sum(f1) / len(f1)
         print(f"Test F1 : {test_f1:.2f}")
     return test_f1
-    # report = classification_report(y_true, y_pred, target_names=classes, digits=3)
-    # cm = confusion_matrix(y_true, y_pred, normalize="all")
-    # return report, cm
-
 
 
 def save_log(
@@ -225,7 +218,10 @@ def train(
     cls_num = len(temp[label_col])
 
     original_T = len(temp[label_col][0])
-    model = Net(backbone, train_mode, cls_num, original_T, imgnet_ver)
+    if 'vit' in backbone or 'swin' in backbone:
+        model = t_Net(backbone, train_mode, cls_num, original_T, imgnet_ver)
+    else:
+        model = Net(backbone, train_mode, cls_num, original_T, imgnet_ver)
     # load data
     traLoader, valLoader, tesLoader = load_data(
         ds,
@@ -265,14 +261,9 @@ def train(
     os.makedirs(log_dir, exist_ok=True)
     save_to_csv(f"{log_dir}/loss.csv", ["loss_list"])
     save_to_csv(f"{log_dir}/f1.csv", ["tra_f1_list", "val_f1_list", "lr_list"])
-    log_dir = r'C:\Users\oasis\Desktop\tech99-dev\logs\ccmusic-database_Guzheng_Tech99\squeezenet1_1_chroma_2024-12-19_15-59-12'
     
     print(f"Start training {backbone} at {start_time.strftime('%Y-%m-%d %H:%M:%S')}...")
-    
-    save_history(log_dir, tesLoader, cls_num, start_time, dataset,
-        subset, data_col, label_col, backbone, imgnet_ver, train_mode,
-        batch_size, original_T
-    )
+
 
     # loop over the dataset multiple times
     for ep in range(epochs):
@@ -287,8 +278,7 @@ def train(
                 optimizer.zero_grad()
                 # forward + backward + optimize
                 outputs = model.forward(inputs)
-                # outputs shape: [bsz, 7, 258] ?
-                # labels shape: [bsz, 7, 258]
+
                 loss: torch.Tensor = sp_loss(outputs, labels, we)
                 loss.backward()
                 optimizer.step()
@@ -331,7 +321,6 @@ if __name__ == "__main__":
     parser.add_argument("--data", type=str, default="chroma")
     parser.add_argument("--label", type=str, default="label")
     parser.add_argument("--model", type=str, default="squeezenet1_1")
-    # parser.add_argument("--model", type=str, default="vgg16")
     parser.add_argument("--imgnet", type=str, default="v1")
     parser.add_argument("--mode", type=int, default=1)
     parser.add_argument("--bsz", type=int, default=4)
